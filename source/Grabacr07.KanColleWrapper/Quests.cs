@@ -14,12 +14,14 @@ using Nekoxy;
 using Grabacr07.KanColleWrapper.Internal;
 using Grabacr07.KanColleWrapper.Models;
 using Grabacr07.KanColleWrapper.Models.Raw;
+using System.ComponentModel;
+using System.Web;
 
 namespace Grabacr07.KanColleWrapper
 {
 	public class Quests : Notifier
 	{
-		private readonly List<ConcurrentDictionary<int, Quest>> questPages;
+		private readonly List<Quest> allQuests;
 
 		#region All 変更通知プロパティ
 
@@ -103,14 +105,22 @@ namespace Grabacr07.KanColleWrapper
 
 		internal Quests(KanColleProxy proxy)
 		{
-			this.questPages = new List<ConcurrentDictionary<int, Quest>>();
+			this.allQuests = new List<Quest>();
 			this.IsUntaken = true;
 			this.All = this.Current = new List<Quest>();
 
 			proxy.api_get_member_questlist
-				.Select(Serialize)
-				.Where(x => x != null)
-				.Subscribe(this.Update);
+				.Select(x => new { Page = Serialize(x), TabId = HttpUtility.ParseQueryString(x.Request.BodyAsString)["api_tab_id"] })
+				.Where(x => x .Page!= null)
+				.Subscribe(x => this.Update(x.Page, int.Parse(x.TabId)));
+
+			proxy.api_req_quest_clearitemget
+				.Select(x => HttpUtility.ParseQueryString(x.Request.BodyAsString)["api_quest_id"])
+				.Subscribe(x => this.ClearQuest(int.Parse(x)));
+
+			proxy.api_req_quest_stop
+				.Select(x => HttpUtility.ParseQueryString(x.Request.BodyAsString)["api_quest_id"])
+				.Subscribe(x => this.StopQuest(int.Parse(x)));
 		}
 
 		private static kcsapi_questlist Serialize(Session session)
@@ -155,56 +165,113 @@ namespace Grabacr07.KanColleWrapper
 			}
 		}
 
-		private void Update(kcsapi_questlist questlist)
+		private void Update(kcsapi_questlist questlist, int tabId)
 		{
 			this.IsUntaken = false;
 
-			// キャッシュしてるページの数が、取得したページ数 (api_page_count) より大きいとき
-			// 取得したページ数と同じ数になるようにキャッシュしてるページを減らす
-			if (this.questPages.Count > questlist.api_page_count)
-			{
-				while (this.questPages.Count > questlist.api_page_count) this.questPages.RemoveAt(this.questPages.Count - 1);
-			}
-
-			// 小さいときは、キャッシュしたページ数と同じ数になるようにページを増やす
-			else if (this.questPages.Count < questlist.api_page_count)
-			{
-				while (this.questPages.Count < questlist.api_page_count) this.questPages.Add(null);
-			}
-
-			if (questlist.api_list == null)
+			if (tabId == 0 && questlist.api_list == null)
 			{
 				this.IsEmpty = true;
 				this.All = this.Current = new List<Quest>();
 			}
 			else
 			{
-				var page = questlist.api_disp_page - 1;
-				if (page >= this.questPages.Count) page = this.questPages.Count - 1;
-
-				this.questPages[page] = new ConcurrentDictionary<int, Quest>();
-
+				var allPages = this.allQuests.GroupByPage().ToArray();
+				IEnumerable<IGrouping<int, Quest>> pages;
+				switch(tabId)
+				{
+					case 0:
+						pages = this.allQuests.GroupByPage();
+						break;
+					case 9:
+						pages = this.allQuests.GroupByPageInCurrent();
+						break;
+					default:
+						pages = this.allQuests.GroupByPage((QuestType)tabId);
+						break;
+				}
+				var currentPage = pages.SingleOrDefault(x => x.Key == questlist.api_disp_page - 1)?.ToArray() ?? new Quest[0];
 				this.IsEmpty = false;
 
-				foreach (var quest in questlist.api_list.Select(x => new Quest(x)))
+				Debug.WriteLine("//// LocalCurrentPage ////");
+				currentPage.ToList().ForEach(x => Debug.WriteLine(x));
+
+				Debug.WriteLine("//// LocalAllQuests.Before ////");
+				allQuests.ToList().ForEach(x => Debug.WriteLine(x));
+
+				var newPage = questlist.api_list?.Select(x => new Quest(x)).ToArray() ?? new Quest[0];
+				foreach (var quest in currentPage)
 				{
-					this.questPages[page].AddOrUpdate(quest.Id, quest, (_, __) => quest);
+					if(tabId != 9)
+						this.allQuests.RemoveAll(new Predicate<Quest>(x => x.Id == quest.Id));
+				}
+				foreach (var quest in newPage)
+				{
+					if(!this.allQuests.Any(x => x.Id == quest.Id))
+						this.allQuests.Add(quest);
 				}
 
-				this.All = this.questPages.Where(x => x != null)
-					.SelectMany(x => x.Select(kvp => kvp.Value))
-					.Distinct(x => x.Id)
-					.OrderBy(x => x.Id)
-					.ToList();
+				Debug.WriteLine("//// questlist.api_list ////");
+				questlist.api_list?.Select(x => new Quest(x)).ToList().ForEach(x => Debug.WriteLine(x));
+
+				Debug.WriteLine("//// LocalAllQuests.After ////");
+				allQuests.ToList().ForEach(x => Debug.WriteLine(x));
+
+				this.All = this.allQuests
+						.OrderBy(x => x.Id)
+						.ToList();
 
 				var current = this.All.Where(x => x.State == QuestState.TakeOn || x.State == QuestState.Accomplished)
 					.OrderBy(x => x.Id)
 					.ToList();
-
 				// 遂行中の任務数に満たない場合、未取得分として null で埋める
 				while (current.Count < questlist.api_exec_count) current.Add(null);
 				this.Current = current;
 			}
+		}
+
+		private void ClearQuest(int id)
+		{
+			this.allQuests.RemoveAll(new Predicate<Quest>(x => x.Id == id));
+		}
+
+		private void StopQuest(int id)
+		{
+			var quest = this.allQuests.FirstOrDefault(x => x.Id == id);
+			if (quest == null) return;
+
+			this.allQuests.RemoveAll(new Predicate<Quest>(x => x.Id == id));
+			var raw = quest.RawData;
+			raw.api_state = (int)QuestState.None;
+			this.allQuests.Add(new Quest(raw));
+		}
+	}
+
+	[EditorBrowsable(EditorBrowsableState.Never)]
+	static class QuestsExtensions
+	{
+		private static readonly int pageSize = 5;
+
+		public static IEnumerable<IGrouping<int, Quest>> GroupByPage(this IEnumerable<Quest> source)
+		{
+			return source
+				.OrderBy(x => x.Id)
+				.Select((x, i) => new { Quest = x, Index = i })
+				.GroupBy(x => x.Index / pageSize, x => x.Quest);
+		}
+
+		public static IEnumerable<IGrouping<int, Quest>> GroupByPage(this IEnumerable<Quest> source, QuestType type)
+		{
+			return source
+				.Where(x => x.Type == type)
+				.GroupByPage();
+		}
+		
+		public static IEnumerable<IGrouping<int, Quest>> GroupByPageInCurrent(this IEnumerable<Quest> source)
+		{
+			return source
+				.Where(x => x.State == QuestState.TakeOn || x.State == QuestState.Accomplished)
+				.GroupByPage();
 		}
 	}
 }

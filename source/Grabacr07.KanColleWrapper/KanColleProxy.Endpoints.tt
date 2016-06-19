@@ -44,6 +44,8 @@
 		"/kcsapi/api_req_member/updatedeckname",
 		"/kcsapi/api_req_member/updatecomment",
 		"/kcsapi/api_req_mission/result",
+		"/kcsapi/api_req_quest/clearitemget",
+		"/kcsapi/api_req_quest/stop",
 		"/kcsapi/api_req_sortie/battle",
 		"/kcsapi/api_req_sortie/battleresult",
 		"/kcsapi/api_req_hensei/combined",
